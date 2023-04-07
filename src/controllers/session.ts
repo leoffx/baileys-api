@@ -1,6 +1,7 @@
 import type { RequestHandler } from 'express';
 import {
   createSession,
+  createSSESession,
   deleteSession,
   getSession,
   getSessionStatus,
@@ -40,7 +41,14 @@ export const addSSE: RequestHandler = async (req, res) => {
     res.end();
     return;
   }
-  createSession({ sessionId, res, SSE: true });
+  const sessionObervable = await createSSESession({ sessionId });
+  sessionObervable.subscribe({
+    next: (data: string) => res.write(`data: ${JSON.stringify(data)}\n\n`),
+    error: (error: Error) => {
+      res.status(500).json({ error: error.message });
+    },
+    complete: () => res.end(),
+  });
 };
 
 export const del: RequestHandler = async (req, res) => {

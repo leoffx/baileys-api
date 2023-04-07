@@ -11,6 +11,8 @@ import type { Response } from 'express';
 // import { writeFile } from 'fs/promises';
 // import { join } from 'path';
 import { toDataURL } from 'qrcode';
+import type { Observable } from 'rxjs';
+import { Subject } from 'rxjs';
 import type { WebSocket } from 'ws';
 import { logger, prisma } from './shared';
 import { delay } from './utils';
@@ -203,6 +205,126 @@ export async function createSession(options: createSessionOptions) {
     update: {},
     where: { sessionId_id: { id: configID, sessionId } },
   });
+}
+
+export async function createSSESession(options: createSessionOptions): Promise<Observable<string>> {
+  const { sessionId, readIncomingMessages = false, socketConfig } = options;
+  const configID = `${SESSION_CONFIG_ID}-${sessionId}`;
+  let connectionState: Partial<ConnectionState> = { connection: 'close' };
+  const qrObserver = new Subject<string>();
+
+  const destroy = async (logout = true) => {
+    try {
+      await Promise.all([
+        logout && socket.logout(),
+        prisma.chat.deleteMany({ where: { sessionId } }),
+        prisma.contact.deleteMany({ where: { sessionId } }),
+        prisma.message.deleteMany({ where: { sessionId } }),
+        prisma.groupMetadata.deleteMany({ where: { sessionId } }),
+        prisma.session.deleteMany({ where: { sessionId } }),
+      ]);
+    } catch (e) {
+      logger.error(e, 'An error occured during session destroy');
+    } finally {
+      sessions.delete(sessionId);
+    }
+  };
+
+  const handleConnectionClose = () => {
+    const code = (connectionState.lastDisconnect?.error as Boom)?.output?.statusCode;
+    const restartRequired = code === DisconnectReason.restartRequired;
+    const doNotReconnect = !shouldReconnect(sessionId);
+
+    if (code === DisconnectReason.loggedOut || doNotReconnect) {
+      destroy(doNotReconnect);
+      qrObserver.complete();
+      return;
+    }
+
+    if (!restartRequired) {
+      logger.info({ attempts: retries.get(sessionId) ?? 1, sessionId }, 'Reconnecting...');
+    }
+    setTimeout(() => createSSESession(options), restartRequired ? 0 : RECONNECT_INTERVAL);
+  };
+
+  const handleSSEConnectionUpdate = async () => {
+    const currentGenerations = SSEQRGenerations.get(sessionId) ?? 0;
+    if (currentGenerations >= SSE_MAX_QR_GENERATION) {
+      destroy();
+      qrObserver.complete();
+      return;
+    }
+    SSEQRGenerations.set(sessionId, currentGenerations + 1);
+
+    if (connectionState.qr?.length) {
+      const qr = await toDataURL(connectionState.qr);
+      qrObserver.next(qr);
+    }
+  };
+
+  const { state, saveCreds } = await useSession(sessionId);
+  const socket = makeWASocket({
+    printQRInTerminal: false,
+    browser: Browsers.ubuntu('Chrome'),
+    generateHighQualityLinkPreview: true,
+    ...socketConfig,
+    auth: {
+      creds: state.creds,
+      keys: makeCacheableSignalKeyStore(state.keys, logger),
+    },
+    logger,
+    shouldIgnoreJid: (jid) => isJidBroadcast(jid),
+    getMessage: async (key) => {
+      const data = await prisma.message.findFirst({
+        where: { remoteJid: key.remoteJid!, id: key.id!, sessionId },
+      });
+      return (data?.message || undefined) as proto.IMessage | undefined;
+    },
+  });
+
+  const store = new Store(sessionId, socket.ev);
+  sessions.set(sessionId, { ...socket, destroy, store });
+
+  socket.ev.on('creds.update', saveCreds);
+  socket.ev.on('connection.update', (update) => {
+    connectionState = update;
+    const { connection } = update;
+
+    if (connection === 'open') {
+      retries.delete(sessionId);
+      SSEQRGenerations.delete(sessionId);
+    }
+    if (connection === 'close') handleConnectionClose();
+    handleSSEConnectionUpdate();
+  });
+
+  if (readIncomingMessages) {
+    socket.ev.on('messages.upsert', async (m) => {
+      const message = m.messages[0];
+      if (message.key.fromMe || m.type !== 'notify') return;
+
+      await delay(1000);
+      await socket.readMessages([message.key]);
+    });
+  }
+
+  // Debug events
+  // socket.ev.on('messaging-history.set', (data) => dump('messaging-history.set', data));
+  // socket.ev.on('chats.upsert', (data) => dump('chats.upsert', data));
+  // socket.ev.on('contacts.update', (data) => dump('contacts.update', data));
+  // socket.ev.on('groups.upsert', (data) => dump('groups.upsert', data));
+
+  await prisma.session.upsert({
+    create: {
+      id: configID,
+      sessionId,
+      data: JSON.stringify({ readIncomingMessages, ...socketConfig }),
+    },
+    update: {},
+    where: { sessionId_id: { id: configID, sessionId } },
+  });
+
+  return qrObserver;
 }
 
 export function getSessionStatus(session: Session) {
