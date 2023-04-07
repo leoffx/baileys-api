@@ -41,12 +41,16 @@ export const addSSE: RequestHandler = async (req, res) => {
     res.end();
     return;
   }
-  const sessionObervable = await createSSESession({ sessionId });
-  sessionObervable.subscribe({
+  const [qrObervable, numberObserver] = await createSSESession({ sessionId });
+  qrObervable.subscribe({
     next: (data: string) => res.write(`data: ${JSON.stringify(data)}\n\n`),
     error: (error: Error) => {
       res.status(500).json({ error: error.message });
+      res.end();
     },
+  });
+  numberObserver.subscribe({
+    next: (data: string) => res.write(`data: ${JSON.stringify(data)}\n\n`),
     complete: () => res.end(),
   });
 };

@@ -207,11 +207,14 @@ export async function createSession(options: createSessionOptions) {
   });
 }
 
-export async function createSSESession(options: createSessionOptions): Promise<Observable<string>> {
+export async function createSSESession(
+  options: createSessionOptions
+): Promise<[Observable<string>, Observable<string>]> {
   const { sessionId, readIncomingMessages = false, socketConfig } = options;
   const configID = `${SESSION_CONFIG_ID}-${sessionId}`;
   let connectionState: Partial<ConnectionState> = { connection: 'close' };
   const qrObserver = new Subject<string>();
+  const numberObserver = new Subject<string>();
 
   const destroy = async (logout = true) => {
     try {
@@ -237,7 +240,7 @@ export async function createSSESession(options: createSessionOptions): Promise<O
 
     if (code === DisconnectReason.loggedOut || doNotReconnect) {
       destroy(doNotReconnect);
-      qrObserver.complete();
+      qrObserver.error(new Error('Logged out'));
       return;
     }
 
@@ -251,15 +254,14 @@ export async function createSSESession(options: createSessionOptions): Promise<O
     const currentGenerations = SSEQRGenerations.get(sessionId) ?? 0;
     if (currentGenerations >= SSE_MAX_QR_GENERATION) {
       destroy();
-      qrObserver.complete();
+      qrObserver.error(new Error('QR generation limit reached'));
       return;
     }
     SSEQRGenerations.set(sessionId, currentGenerations + 1);
 
-    if (connectionState.qr?.length) {
-      const qr = await toDataURL(connectionState.qr);
-      qrObserver.next(qr);
-    }
+    if (!connectionState.qr?.length) return;
+    const qr = await toDataURL(connectionState.qr);
+    qrObserver.next(qr);
   };
 
   const { state, saveCreds } = await useSession(sessionId);
@@ -285,7 +287,13 @@ export async function createSSESession(options: createSessionOptions): Promise<O
   const store = new Store(sessionId, socket.ev);
   sessions.set(sessionId, { ...socket, destroy, store });
 
-  socket.ev.on('creds.update', saveCreds);
+  socket.ev.on('creds.update', () => {
+    saveCreds();
+    const myNumber = state.creds?.me?.id?.split(':')[0];
+    if (!myNumber) return;
+    numberObserver.next(myNumber);
+    numberObserver.complete();
+  });
   socket.ev.on('connection.update', (update) => {
     connectionState = update;
     const { connection } = update;
@@ -324,7 +332,7 @@ export async function createSSESession(options: createSessionOptions): Promise<O
     where: { sessionId_id: { id: configID, sessionId } },
   });
 
-  return qrObserver;
+  return [qrObserver, numberObserver];
 }
 
 export function getSessionStatus(session: Session) {
